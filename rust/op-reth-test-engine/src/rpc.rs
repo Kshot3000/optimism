@@ -2,11 +2,12 @@
 //! `rpc.DialIPC`-compatible) by the companion binary.
 //!
 //! Three namespaces mirror what `op-e2e/actions` drives against the in-process op-geth engine:
-//! `engine_*` (the versioned newPayload/forkchoiceUpdated/getPayload trio), `eth_*` (chain reads
-//! and `eth_sendRawTransaction` into a parking buffer), and `optest_*` — the sequencing hooks that
-//! replace the direct `L2EngineAPI` method calls (`includeTx`, `includeNextTx`,
-//! `remainingBlockGas`, `forcedEmpty`, `setForceEmpty`) and the sync-backfill hooks that stand in
-//! for devp2p sync (`syncTarget`, `blockPayloadByNumber`, `importBlock`).
+//! `engine_*` (the versioned newPayload/forkchoiceUpdated/getPayload trio), `eth_*` (chain and
+//! state reads, `eth_call`/`eth_estimateGas`, and `eth_sendRawTransaction` into a parking
+//! buffer), and `optest_*` — the sequencing hooks that replace the direct `L2EngineAPI` method
+//! calls (`includeTx`, `includeNextTx`, `remainingBlockGas`, `forcedEmpty`, `setForceEmpty`) and
+//! the sync-backfill hooks that stand in for devp2p sync (`syncTarget`, `blockPayloadByNumber`,
+//! `importBlock`).
 //!
 //! The engine's methods take `&mut self`, so the module context is an `Arc<Mutex<TestEngine>>` and
 //! requests are served one at a time; a poisoned lock is recovered rather than propagated so one
@@ -14,12 +15,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use alloy_consensus::transaction::{Recovered, SignerRecoverable, TransactionInfo};
 use alloy_eips::eip7685::Requests;
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ForkchoiceState, PayloadId, PraguePayloadFields,
 };
+use alloy_serde::JsonStorageKey;
 use jsonrpsee::{RpcModule, types::ErrorObjectOwned};
+
+use op_alloy_rpc_types::Transaction as OpRpcTransaction;
 use op_alloy_rpc_types_engine::{
     OpExecutionData, OpExecutionPayload, OpExecutionPayloadEnvelope, OpExecutionPayloadSidecar,
     OpPayloadAttributes,
@@ -27,6 +32,8 @@ use op_alloy_rpc_types_engine::{
 use reth_optimism_primitives::OpBlock;
 use reth_payload_primitives::EngineApiMessageVersion;
 use reth_rpc_engine_api::EngineApiError;
+use reth_rpc_eth_types::error::RevertError;
+use reth_storage_api::{StateProofProvider, StateProvider, StateProviderBox};
 use serde_json::{Value, json};
 
 use crate::{IncludeNextOutcome, IncludeTxOutcome, TestEngine};
@@ -42,6 +49,9 @@ const ERR_CODE: i32 = -38000;
 fn rpc_err(msg: impl std::fmt::Display) -> ErrorObjectOwned {
     ErrorObjectOwned::owned(ERR_CODE, msg.to_string(), None::<()>)
 }
+
+/// go-ethereum's JSON-RPC error code for reverted `eth_call`/`eth_estimateGas` executions.
+const REVERT_ERR_CODE: i32 = 3;
 
 /// go-ethereum's engine-API error code for an unknown payload id (`engine.UnknownPayload`).
 /// op-node's build/seal path keys on exactly this code and remaps it to
@@ -90,6 +100,23 @@ fn get_payload_err(err: crate::Error) -> ErrorObjectOwned {
     }
 }
 
+/// Map an engine error to a JSON-RPC error; a revert becomes geth's shape — code 3, a message
+/// carrying the ABI-decoded reason when there is one, and the raw output as error data (which
+/// go-ethereum clients read via `rpc.DataError`).
+fn call_err(err: crate::Error) -> ErrorObjectOwned {
+    match err {
+        crate::Error::Revert(output) => {
+            let data = format!("0x{}", alloy_primitives::hex::encode(&output));
+            ErrorObjectOwned::owned(
+                REVERT_ERR_CODE,
+                RevertError::new(output).to_string(),
+                Some(data),
+            )
+        }
+        other => rpc_err(other),
+    }
+}
+
 /// Lock the engine, recovering the guard if a previous handler panicked while holding it.
 fn lock(engine: &SharedEngine) -> std::sync::MutexGuard<'_, TestEngine> {
     engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -122,39 +149,130 @@ fn execution_data(
 }
 
 /// Serialize an OP block as an `eth_getBlock*` result: the RPC header (which carries the block
-/// hash) plus the block's transaction hashes. Faithful enough for the chain-shape assertions the
-/// action tests make; full transaction objects are not needed by any caller yet.
-fn block_json(block: &OpBlock) -> Result<Value, ErrorObjectOwned> {
+/// hash) plus its transactions. With `full` false the `transactions` array is the transaction
+/// hashes; with `full` true it is the full OP RPC transaction objects.
+///
+/// op-node's `sources.EthClient` reconstructs the `ExecutionPayload` and the `L2BlockRef` (from the
+/// L1-info deposit) out of the full-transaction form, so the full path must emit exactly the JSON
+/// go-ethereum's transaction decoder round-trips back to the same RLP the block was sealed with —
+/// including the deposit-transaction fields. That is precisely what
+/// [`OpRpcTransaction::from_transaction`] produces (it is what reth serves in production).
+fn block_json(engine: &TestEngine, block: &OpBlock, full: bool) -> Result<Value, ErrorObjectOwned> {
     let header = alloy_rpc_types_eth::Header::new(block.header.clone());
+    let block_hash = header.hash;
     let mut value = serde_json::to_value(&header).map_err(rpc_err)?;
-    let tx_hashes: Vec<B256> = block.body.transactions.iter().map(|tx| tx.tx_hash()).collect();
+    let txs = if full {
+        full_transactions(engine, block, block_hash)?
+    } else {
+        let hashes: Vec<B256> = block.body.transactions.iter().map(|tx| tx.tx_hash()).collect();
+        serde_json::to_value(hashes).map_err(rpc_err)?
+    };
     if let Value::Object(map) = &mut value {
-        map.insert("transactions".into(), serde_json::to_value(tx_hashes).map_err(rpc_err)?);
+        map.insert("transactions".into(), txs);
         map.insert("uncles".into(), json!([]));
+        // Post-Canyon OP blocks carry an (always empty) withdrawals list alongside the
+        // withdrawals-root header field; op-node rejects a block that has the root but no list.
+        if let Some(withdrawals) = &block.body.withdrawals {
+            map.insert("withdrawals".into(), serde_json::to_value(withdrawals).map_err(rpc_err)?);
+        }
     }
     Ok(value)
 }
 
+/// Serialize a block's transactions as full OP RPC transaction objects, in block order.
+///
+/// The signer is recovered per transaction (deposits recover to their `from` field), and a
+/// deposit's nonce and receipt version are read from its receipt.
+fn full_transactions(
+    engine: &TestEngine,
+    block: &OpBlock,
+    block_hash: B256,
+) -> Result<Value, ErrorObjectOwned> {
+    let base_fee = block.header.base_fee_per_gas;
+    let mut out = Vec::with_capacity(block.body.transactions.len());
+    for (index, tx) in block.body.transactions.iter().enumerate() {
+        let signer = tx.recover_signer().map_err(|e| rpc_err(format!("recover signer: {e}")))?;
+        let recovered = Recovered::new_unchecked(tx.clone(), signer);
+        let tx_info = engine
+            .chain
+            .rpc_transaction_info(
+                tx,
+                TransactionInfo {
+                    hash: None,
+                    index: Some(index as u64),
+                    block_hash: Some(block_hash),
+                    block_number: Some(block.header.number),
+                    base_fee,
+                    block_timestamp: Some(block.header.timestamp),
+                },
+            )
+            .map_err(rpc_err)?;
+        let rpc_tx = OpRpcTransaction::from_transaction(recovered, tx_info);
+        out.push(serde_json::to_value(rpc_tx).map_err(rpc_err)?);
+    }
+    Ok(Value::Array(out))
+}
+
 /// Resolve a block-number-or-tag string (`latest`/`safe`/`finalized`/`earliest`/`pending` or a
-/// `0x`-hex number) to a block, or `None` if unknown.
-fn resolve_block(engine: &TestEngine, tag: &str) -> Result<Option<OpBlock>, ErrorObjectOwned> {
+/// `0x`-hex number) to a block hash, or `None` if the block is unknown.
+fn resolve_block_hash(engine: &TestEngine, tag: &str) -> Result<Option<B256>, ErrorObjectOwned> {
     let hash = match tag {
         "latest" | "pending" => Some(engine.chain.latest_header().hash()),
         "safe" => engine.chain.safe_header().map(|h| h.hash()),
         "finalized" => engine.chain.finalized_header().map(|h| h.hash()),
-        "earliest" => return engine.block_by_number(0).map_err(rpc_err),
+        "earliest" => Some(engine.chain.genesis_hash()),
+        // A 32-byte hex string is a block hash, not a number: op-node passes `blockHash.String()`
+        // as the block tag to `eth_getProof`, and go-ethereum treats any 66-char `0x` string that
+        // way. Resolve it to itself only if the block is known.
+        hash if hash.len() == 66 && hash.starts_with("0x") => {
+            let hash: B256 =
+                hash.parse().map_err(|e| rpc_err(format!("invalid block hash {hash:?}: {e}")))?;
+            engine.chain.sealed_header(hash).map_err(rpc_err)?.map(|_| hash)
+        }
         num => {
             let n = u64::from_str_radix(num.trim_start_matches("0x"), 16)
                 .map_err(|e| rpc_err(format!("invalid block number {num:?}: {e}")))?;
-            return engine.block_by_number(n).map_err(rpc_err);
+            engine.block_by_number(n).map_err(rpc_err)?.map(|block| block.header.hash_slow())
         }
     };
-    hash.map_or_else(|| Ok(None), |hash| engine.block_by_hash(hash).map_err(rpc_err))
+    Ok(hash)
+}
+
+/// Resolve a block-number-or-tag string to a block, or `None` if unknown.
+fn resolve_block(engine: &TestEngine, tag: &str) -> Result<Option<OpBlock>, ErrorObjectOwned> {
+    resolve_block_hash(engine, tag)?
+        .map_or_else(|| Ok(None), |hash| engine.block_by_hash(hash).map_err(rpc_err))
+}
+
+/// The state provider at a block-number-or-tag, or a "block unknown" error. This is a real
+/// historical overlay for blocks below the tip: reth composes the in-memory blocks' trie updates on
+/// top of the persisted genesis state, so account/storage reads and `eth_getProof` are answered at
+/// exactly that block's state — the property op-node's `OutputV0AtBlock` relies on when it verifies
+/// a message-passer proof against a past block's state root.
+fn state_at_tag(engine: &TestEngine, tag: &str) -> Result<StateProviderBox, ErrorObjectOwned> {
+    let hash = resolve_block_hash(engine, tag)?
+        .ok_or_else(|| rpc_err(format!("block {tag:?} is unknown")))?;
+    engine
+        .chain
+        .state_at(hash)
+        .map_err(rpc_err)?
+        .ok_or_else(|| rpc_err(format!("no state for block {tag:?}")))
 }
 
 /// Encode a `u64` as a `0x`-prefixed hex quantity — the JSON form `eth_*` numeric results use.
 fn quantity(n: u64) -> Value {
     Value::String(format!("0x{n:x}"))
+}
+
+/// Encode a [`U256`] as a `0x`-prefixed hex quantity (balances, storage values as quantities).
+fn u256_quantity(v: U256) -> Value {
+    Value::String(format!("0x{v:x}"))
+}
+
+/// Resolve the optional block tag argument shared by the account-read methods, defaulting to
+/// `latest`.
+fn tag_or_latest(tag: Option<String>) -> String {
+    tag.unwrap_or_else(|| "latest".to_string())
 }
 
 /// Build the JSON-RPC module serving `engine_*`, `eth_*`, and `optest_*` over `engine`.
@@ -325,12 +443,10 @@ pub fn build_module(engine: SharedEngine) -> RpcModule<SharedEngine> {
     .expect("register method");
 
     m.register_method("eth_getBlockByNumber", |params, ctx, _| {
-        // Second param (full-transactions) is accepted for compatibility but ignored: results
-        // always carry transaction hashes.
-        let (tag, _full): (String, Option<bool>) = params.parse().map_err(rpc_err)?;
+        let (tag, full): (String, Option<bool>) = params.parse().map_err(rpc_err)?;
         let engine = lock(ctx);
         let value = match resolve_block(&engine, &tag)? {
-            Some(block) => block_json(&block)?,
+            Some(block) => block_json(&engine, &block, full.unwrap_or(false))?,
             None => Value::Null,
         };
         Ok::<Value, ErrorObjectOwned>(value)
@@ -338,13 +454,40 @@ pub fn build_module(engine: SharedEngine) -> RpcModule<SharedEngine> {
     .expect("register method");
 
     m.register_method("eth_getBlockByHash", |params, ctx, _| {
-        let (hash, _full): (B256, Option<bool>) = params.parse().map_err(rpc_err)?;
+        let (hash, full): (B256, Option<bool>) = params.parse().map_err(rpc_err)?;
         let engine = lock(ctx);
         let value = match engine.block_by_hash(hash).map_err(rpc_err)? {
-            Some(block) => block_json(&block)?,
+            Some(block) => block_json(&engine, &block, full.unwrap_or(false))?,
             None => Value::Null,
         };
         Ok::<Value, ErrorObjectOwned>(value)
+    })
+    .expect("register method");
+
+    // Account state reads, all at a historical block tag. `eth_getProof` is the load-bearing one:
+    // op-node runs it against the L2ToL1MessagePasser predeploy and verifies the returned account +
+    // storage proof against the block's state root to derive the withdrawals (output) root.
+    m.register_method("eth_getProof", |params, ctx, _| {
+        let (address, keys, tag): (Address, Vec<JsonStorageKey>, Option<String>) =
+            params.parse().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let state = state_at_tag(&engine, &tag_or_latest(tag))?;
+        let slots: Vec<B256> = keys.iter().map(JsonStorageKey::as_b256).collect();
+        // A default (empty) `TrieInput` is correct here: the historical overlay provider already
+        // folds the in-memory blocks' trie changes into its own input before computing the proof.
+        let proof = state.proof(Default::default(), address, &slots).map_err(rpc_err)?;
+        serde_json::to_value(proof.into_eip1186_response(keys)).map_err(rpc_err)
+    })
+    .expect("register method");
+
+    m.register_method("eth_getBalance", |params, ctx, _| {
+        let (address, tag): (Address, Option<String>) = params.parse().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let balance = state_at_tag(&engine, &tag_or_latest(tag))?
+            .account_balance(&address)
+            .map_err(rpc_err)?
+            .unwrap_or_default();
+        Ok::<Value, ErrorObjectOwned>(u256_quantity(balance))
     })
     .expect("register method");
 
@@ -354,6 +497,131 @@ pub fn build_module(engine: SharedEngine) -> RpcModule<SharedEngine> {
         let raw: Bytes = params.one().map_err(rpc_err)?;
         let hash = lock(ctx).send_raw_transaction(raw.as_ref()).map_err(rpc_err)?;
         serde_json::to_value(hash).map_err(rpc_err)
+    })
+    .expect("register method");
+
+    m.register_method("eth_getTransactionCount", |params, ctx, _| {
+        let (address, tag): (Address, Option<String>) = params.parse().map_err(rpc_err)?;
+        let tag = tag_or_latest(tag);
+        let engine = lock(ctx);
+        // "pending" folds in the parked buffer so the caller's next-nonce read accounts for txs it
+        // has already submitted but not yet had included; every other tag reads committed state.
+        let nonce = if tag == "pending" {
+            engine.pending_nonce(address).map_err(rpc_err)?
+        } else {
+            state_at_tag(&engine, &tag)?
+                .account_nonce(&address)
+                .map_err(rpc_err)?
+                .unwrap_or_default()
+        };
+        Ok::<Value, ErrorObjectOwned>(quantity(nonce))
+    })
+    .expect("register method");
+
+    m.register_method("eth_getCode", |params, ctx, _| {
+        let (address, tag): (Address, Option<String>) = params.parse().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let code = state_at_tag(&engine, &tag_or_latest(tag))?
+            .account_code(&address)
+            .map_err(rpc_err)?
+            .map(|bytecode| bytecode.original_bytes())
+            .unwrap_or_default();
+        serde_json::to_value(code).map_err(rpc_err)
+    })
+    .expect("register method");
+
+    // OP-enriched receipts. op-node's `FetchReceipts` (RPCKindStandard) calls
+    // `eth_getBlockReceipts` with the block hash, falling back to batched
+    // `eth_getTransactionReceipt`; both must return receipts whose consensus re-encoding
+    // reproduces the header receipts-root (op-node's validateReceipts), which is exactly what
+    // reth's OpReceiptConverter path preserves.
+    m.register_method("eth_getBlockReceipts", |params, ctx, _| {
+        let tag: String = params.one().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let value = match resolve_block_hash(&engine, &tag)? {
+            Some(hash) => match engine.rpc_receipts_by_block_hash(hash).map_err(rpc_err)? {
+                Some(receipts) => serde_json::to_value(receipts).map_err(rpc_err)?,
+                None => Value::Null,
+            },
+            None => Value::Null,
+        };
+        Ok::<Value, ErrorObjectOwned>(value)
+    })
+    .expect("register method");
+
+    m.register_method("eth_getTransactionReceipt", |params, ctx, _| {
+        let tx_hash: B256 = params.one().map_err(rpc_err)?;
+        let value = match lock(ctx).rpc_receipt_by_tx_hash(tx_hash).map_err(rpc_err)? {
+            Some(receipt) => serde_json::to_value(receipt).map_err(rpc_err)?,
+            None => Value::Null,
+        };
+        Ok::<Value, ErrorObjectOwned>(value)
+    })
+    .expect("register method");
+
+    m.register_method("eth_getTransactionByHash", |params, ctx, _| {
+        let tx_hash: B256 = params.one().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let Some((tx, meta)) = engine.chain.transaction_by_hash(tx_hash).map_err(rpc_err)? else {
+            return Ok(Value::Null);
+        };
+        let signer = tx.recover_signer().map_err(|e| rpc_err(format!("recover signer: {e}")))?;
+        let tx_info = engine
+            .chain
+            .rpc_transaction_info(
+                &tx,
+                TransactionInfo {
+                    hash: Some(tx_hash),
+                    index: Some(meta.index),
+                    block_hash: Some(meta.block_hash),
+                    block_number: Some(meta.block_number),
+                    base_fee: meta.base_fee,
+                    block_timestamp: Some(meta.timestamp),
+                },
+            )
+            .map_err(rpc_err)?;
+        let rpc_tx =
+            OpRpcTransaction::from_transaction(Recovered::new_unchecked(tx, signer), tx_info);
+        serde_json::to_value(rpc_tx).map_err(rpc_err)
+    })
+    .expect("register method");
+
+    // Read-only EVM execution at a block's state. The call-object argument is go-ethereum's
+    // `toCallArg` form; the trailing block tag is optional (defaulting to latest, matching geth).
+    m.register_method("eth_call", |params, ctx, _| {
+        let mut seq = params.sequence();
+        let request: alloy_rpc_types_eth::TransactionRequest = seq.next().map_err(rpc_err)?;
+        let tag: Option<String> = seq.optional_next().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let hash = resolve_block_hash(&engine, &tag_or_latest(tag))?
+            .ok_or_else(|| rpc_err("block is unknown"))?;
+        let output = engine.eth_call(hash, request).map_err(call_err)?;
+        serde_json::to_value(output).map_err(rpc_err)
+    })
+    .expect("register method");
+
+    m.register_method("eth_estimateGas", |params, ctx, _| {
+        let mut seq = params.sequence();
+        let request: alloy_rpc_types_eth::TransactionRequest = seq.next().map_err(rpc_err)?;
+        let tag: Option<String> = seq.optional_next().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let hash = resolve_block_hash(&engine, &tag_or_latest(tag))?
+            .ok_or_else(|| rpc_err("block is unknown"))?;
+        let gas = engine.estimate_gas(hash, request).map_err(call_err)?;
+        Ok::<Value, ErrorObjectOwned>(quantity(gas))
+    })
+    .expect("register method");
+
+    m.register_method("eth_getStorageAt", |params, ctx, _| {
+        let (address, slot, tag): (Address, B256, Option<String>) =
+            params.parse().map_err(rpc_err)?;
+        let engine = lock(ctx);
+        let value = state_at_tag(&engine, &tag_or_latest(tag))?
+            .storage(address, slot)
+            .map_err(rpc_err)?
+            .unwrap_or_default();
+        // eth_getStorageAt returns a full 32-byte word, not a trimmed quantity.
+        serde_json::to_value(B256::from(value.to_be_bytes::<32>())).map_err(rpc_err)
     })
     .expect("register method");
 
@@ -367,6 +635,65 @@ mod tests {
         deposit_tx, depositor, encode, fcu, payload_attrs, test_engine, user_sender, user_tx,
     };
     use jsonrpsee::core::server::MethodsError;
+
+    /// An engine whose head is block 1, holding a single deposit.
+    fn engine_with_deposit() -> (SharedEngine, B256) {
+        let mut engine = test_engine(user_sender());
+        let genesis = engine.chain.genesis_hash();
+        let attrs = payload_attrs(2, vec![encode(&deposit_tx(depositor()))], false);
+        let id = engine
+            .forkchoice_updated_as_op_node(fcu(genesis), Some(attrs))
+            .unwrap()
+            .payload_id
+            .unwrap();
+        let data = engine.get_payload(id).unwrap();
+        let block_hash = data.payload.block_hash();
+        assert!(engine.new_payload(data).unwrap().is_valid());
+        assert!(engine.forkchoice_updated_as_op_node(fcu(block_hash), None).unwrap().is_valid());
+        (Arc::new(Mutex::new(engine)), block_hash)
+    }
+
+    fn assert_deposit_fields(tx: &Value) {
+        assert_eq!(tx["type"], "0x7e", "{tx}");
+        assert_eq!(tx["nonce"], "0x0", "deposit nonce missing: {tx}");
+        assert_eq!(tx["depositReceiptVersion"], "0x1", "receipt version missing: {tx}");
+    }
+
+    #[tokio::test]
+    async fn deposit_transactions_carry_their_nonce_and_receipt_version() {
+        let (engine, block_hash) = engine_with_deposit();
+        let module = build_module(engine);
+        let deposit_hash = deposit_tx(depositor()).tx_hash();
+
+        let tx: Value = module.call("eth_getTransactionByHash", [deposit_hash]).await.unwrap();
+        assert_deposit_fields(&tx);
+
+        let block: Value = module.call("eth_getBlockByHash", (block_hash, true)).await.unwrap();
+        assert_deposit_fields(&block["transactions"][0]);
+    }
+
+    #[test]
+    fn revert_with_an_overflowing_reason_length_does_not_panic() {
+        // Error(string) selector, offset 0x20, then a length so large that adding the 64-byte
+        // header overflows.
+        let mut output = vec![0x08, 0xc3, 0x79, 0xa0];
+        output.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+        output.extend_from_slice(&U256::from(usize::MAX).to_be_bytes::<32>());
+        let err = call_err(crate::Error::Revert(output.into()));
+        assert_eq!(err.code(), REVERT_ERR_CODE);
+        assert!(err.message().starts_with("execution reverted"), "{}", err.message());
+    }
+
+    #[test]
+    fn revert_reason_is_decoded() {
+        // Error(string) selector, offset 0x20, length 4, then "nope" right-padded to a word.
+        let mut output = vec![0x08, 0xc3, 0x79, 0xa0];
+        output.extend_from_slice(&U256::from(32).to_be_bytes::<32>());
+        output.extend_from_slice(&U256::from(4).to_be_bytes::<32>());
+        output.extend_from_slice(&B256::right_padding_from(b"nope").0);
+        let err = call_err(crate::Error::Revert(output.into()));
+        assert_eq!(err.message(), "execution reverted: nope");
+    }
 
     /// Open a build on genesis over `engine_forkchoiceUpdatedV3` with `attrs` and return the
     /// JSON-RPC error code the update fails with.

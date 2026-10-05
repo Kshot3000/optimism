@@ -11,6 +11,7 @@
 
 mod builder;
 mod chain;
+mod ethcall;
 mod exec;
 pub mod rpc;
 #[cfg(test)]
@@ -28,6 +29,7 @@ use alloy_primitives::{Address, B256, Bytes, keccak256};
 use alloy_rpc_types_engine::{
     ForkchoiceState, ForkchoiceUpdated, PayloadId, PayloadStatus, PayloadStatusEnum,
 };
+use op_alloy_rpc_types::OpTransactionReceipt;
 use op_alloy_rpc_types_engine::{OpExecutionData, OpPayloadAttributes};
 use reth_chain_state::ExecutedBlock;
 use reth_db_common::init::InitStorageError;
@@ -114,6 +116,10 @@ pub enum Error {
     /// A raw transaction could not be decoded.
     #[error("failed to decode transaction: {0}")]
     TxDecode(String),
+    /// An `eth_call`/`eth_estimateGas` execution reverted. Carries the revert output so the RPC
+    /// layer can attach it as error data (geth revert errors do the same).
+    #[error("execution reverted")]
+    Revert(Bytes),
 }
 
 /// A forkchoice pointer other than the head.
@@ -433,6 +439,41 @@ impl TestEngine {
     /// Fetch the receipts of a block by hash, or `None` if unknown.
     pub fn receipts_by_block_hash(&self, hash: B256) -> Result<Option<Vec<OpReceipt>>> {
         self.chain.receipts_by_block_hash(hash)
+    }
+
+    /// Build the OP-enriched RPC receipts of a block by hash (`eth_getBlockReceipts`), or `None` if
+    /// the block is unknown.
+    pub fn rpc_receipts_by_block_hash(
+        &self,
+        hash: B256,
+    ) -> Result<Option<Vec<OpTransactionReceipt>>> {
+        self.chain.rpc_receipts_by_block_hash(hash)
+    }
+
+    /// Build the OP-enriched RPC receipt of a transaction (`eth_getTransactionReceipt`), or `None`
+    /// if the transaction is unknown.
+    pub fn rpc_receipt_by_tx_hash(&self, tx_hash: B256) -> Result<Option<OpTransactionReceipt>> {
+        self.chain.rpc_receipt_by_tx_hash(tx_hash)
+    }
+
+    /// Execute a call request read-only at the state of block `block_hash` (`eth_call`),
+    /// returning the call output. A revert surfaces as [`Error::Revert`].
+    pub fn eth_call(
+        &self,
+        block_hash: B256,
+        request: alloy_rpc_types_eth::TransactionRequest,
+    ) -> Result<Bytes> {
+        ethcall::call(&self.chain, block_hash, request)
+    }
+
+    /// Estimate the lowest gas limit that lets `request` succeed at the state of block
+    /// `block_hash` (`eth_estimateGas`), mirroring op-geth's estimator (see `ethcall`).
+    pub fn estimate_gas(
+        &self,
+        block_hash: B256,
+        request: alloy_rpc_types_eth::TransactionRequest,
+    ) -> Result<u64> {
+        ethcall::estimate_gas(&self.chain, block_hash, request)
     }
 
     /// Park a raw transaction in the pending buffer (`eth_sendRawTransaction`), returning its hash.
